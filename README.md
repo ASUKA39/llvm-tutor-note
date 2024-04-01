@@ -1977,7 +1977,155 @@ FindFCmpEq::Result FindFCmpEq::run(Function &Func) {
 
 ### First Taste
 
+```shell
+clang-17 -Xclang -disable-O0-optnone -emit-llvm -S -c ../inputs/input_for_fcmp_eq.c -o input_for_fcmp_eq.ll
+opt-17 --load-pass-plugin ./lib/libFindFCmpEq.so --load-pass-plugin ./lib/libConvertFCmpEq.so -passes=convert-fcmp-eq -S input_for_fcmp_eq.ll -o fcmp_eq_after_conversion.ll
+```
 
+运行后，所有`fcmp oeq`指令都被替换为`fcmp olt`指令，什么意思呢？看下面的 IR
+
+- 原来的 IR
+
+  ```llvm
+  %11 = fcmp oeq double %9, %10
+  ```
+
+- 现在的 IR
+
+  ```llvm
+  %11 = fsub double %9, %10
+  %12 = bitcast double %11 to i64
+  %13 = and i64 %12, 9223372036854775807
+  %14 = bitcast i64 %13 to double
+  %15 = fcmp olt double %14, 0x3CB0000000000000
+  ```
+
+其实就是将`a == b`改变成了`|a - b| <= ε`，即将浮点数的绝对相等变成了绝对误差小于`ε`则认为相等，这里取的误差值`0x3CB0000000000000`转为双精度浮点数后值为$2^{-52}$（经验证还远没到 double 的精度下限）
 
 ### Code Analysis
 
+`run`函数内调用了前面的`FindFcmpEq`，并对结果进行操作
+
+```c++
+PreservedAnalyses ConvertFCmpEq::run(Function &Func,
+                                     FunctionAnalysisManager &FAM) {
+  auto &Comparisons = FAM.getResult<FindFCmpEq>(Func);
+  bool Modified = run(Func, Comparisons);
+  return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+bool ConvertFCmpEq::run(llvm::Function &Func,
+                        const FindFCmpEq::Result &Comparisons) {
+  bool Modified = false;
+  // Functions marked explicitly 'optnone' should be ignored since we shouldn't
+  // be changing anything in them anyway.
+  if (Func.hasFnAttribute(Attribute::OptimizeNone)) {
+    LLVM_DEBUG(dbgs() << "Ignoring optnone-marked function \"" << Func.getName()
+                      << "\"\n");
+    Modified = false;
+  } else {
+    for (FCmpInst *FCmp : Comparisons) {
+      if (convertFCmpEqInstruction(FCmp)) {
+        ++FCmpEqConversionCount;
+        Modified = true;
+      }
+    }
+  }
+
+  return Modified;
+}
+```
+
+然后是`convertFCmpEqInstruction`
+
+- 首先获取左右操作数备用
+- 然后用一个 lambda 将`oeq`、`ueq`、`one`、`une`做一些对应的替换预备
+  - `o`和`u`的区别在于`o`的操作数不能是无穷和`NaN`而`u`可以
+- 随后准备好要用的对象，比如 module、context、类型、位掩码、`ε`等
+- 最后建好要替换的 IR Builder，调用`setPredicate`和`setOperand`替换指令、设置左右操作数。替换流程如下
+  - 首先左右操作数相减
+  - 然后将差值从 double `bitcast`转换到 i64，因为浮点数不支持按位与
+  - 然后将转换后的差值按位与`0x7fffffffffffffff`将符号位清零获得绝对值
+  - 按位与完的结果重新`bitcast`回 double
+  - 最后用前面第二步中得到的替换用的指令，将`ε`与结果进行比较，即得结果
+
+```c++
+static FCmpInst *convertFCmpEqInstruction(FCmpInst *FCmp) noexcept {
+  assert(FCmp && "The given fcmp instruction is null");
+
+  if (!FCmp->isEquality()) {
+    // We're only interested in equality-based comparisons, so return null if
+    // this comparison isn't equality-based.
+    return nullptr;
+  }
+
+  Value *LHS = FCmp->getOperand(0);
+  Value *RHS = FCmp->getOperand(1);
+  // Determine the new floating-point comparison predicate based on the current
+  // one.
+  CmpInst::Predicate CmpPred = [FCmp] {
+    switch (FCmp->getPredicate()) {
+    case CmpInst::Predicate::FCMP_OEQ:
+      return CmpInst::Predicate::FCMP_OLT;
+    case CmpInst::Predicate::FCMP_UEQ:
+      return CmpInst::Predicate::FCMP_ULT;
+    case CmpInst::Predicate::FCMP_ONE:
+      return CmpInst::Predicate::FCMP_OGE;
+    case CmpInst::Predicate::FCMP_UNE:
+      return CmpInst::Predicate::FCMP_UGE;
+    default:
+      llvm_unreachable("Unsupported fcmp predicate");
+    }
+  }();
+
+  // Create the objects and values needed to perform the equality comparison
+  // conversion.
+  Module *M = FCmp->getModule();
+  assert(M && "The given fcmp instruction does not belong to a module");
+  LLVMContext &Ctx = M->getContext();
+  IntegerType *I64Ty = IntegerType::get(Ctx, 64);
+  Type *DoubleTy = Type::getDoubleTy(Ctx);
+
+  // Define the sign-mask and double-precision machine epsilon constants.
+  ConstantInt *SignMask = ConstantInt::get(I64Ty, ~(1L << 63));
+  // The machine epsilon value for IEEE 754 double-precision values is 2 ^ -52
+  // or (b / 2) * b ^ -(p - 1) where b (base) = 2 and p (precision) = 53.
+  APInt EpsilonBits(64, 0x3CB0000000000000);
+  Constant *EpsilonValue =
+      ConstantFP::get(DoubleTy, EpsilonBits.bitsToDouble());
+
+  // Create an IRBuilder with an insertion point set to the given fcmp
+  // instruction.
+  IRBuilder<> Builder(FCmp);
+  // Create the subtraction, casting, absolute value, and new comparison
+  // instructions one at a time.
+  // %0 = fsub double %a, %b
+  auto *FSubInst = Builder.CreateFSub(LHS, RHS);
+  // %1 = bitcast double %0 to i64
+  auto *CastToI64 = Builder.CreateBitCast(FSubInst, I64Ty);
+  // %2 = and i64 %1, 0x7fffffffffffffff
+  auto *AbsValue = Builder.CreateAnd(CastToI64, SignMask);
+  // %3 = bitcast i64 %2 to double
+  auto *CastToDouble = Builder.CreateBitCast(AbsValue, DoubleTy);
+  // %4 = fcmp <olt/ult/oge/uge> double %3, 0x3cb0000000000000
+  // Rather than creating a new instruction, we'll just change the predicate and
+  // operands of the existing fcmp instruction to match what we want.
+  FCmp->setPredicate(CmpPred);
+  FCmp->setOperand(0, CastToDouble);
+  FCmp->setOperand(1, EpsilonValue);
+  return FCmp;
+}
+```
+
+## Tips
+
+- 新的 PM 规定 Transformation Pass 继承自`PassInfoMixin`，而 Analysis Pass 继承自`AnalysisInfoMixin`
+- 之前我们做的都是 Dynamic Plugin，也就是动态加载的 .so 库，如果想做成静态的就得将 Pass 放进 LLVM Project 的`llvm`目录下，然后只用指定`--passes`参数就可以使用了
+- LLVM 还自带了很多 Pass，不过涉及优化算法大多很复杂，这个 Tutor 也给了一些认为比较适合新人入手的 Pass 和对应的测试文件
+  - dce：死代码消除
+  - memcpyopt：针对`memcpy`的优化，比如用`memset`替换
+  - reassociate：调换运算表达式（比如交换律、结合律）的顺序以供进一步优化
+  - always-inline：内联那些`alwaysinline`修饰的函数
+  - loop-deletion：删除未使用的循环
+  - licm：[Loop-Invariant Code Motion](https://en.wikipedia.org/wiki/Loop-invariant_code_motion)，循环不变代码外提
+  - slp：[Superword-level parallelism vectorisation](https://llvm.org/docs/Vectorizers.html#the-slp-vectorizer)，大概是将可以向量并行化的操作做并行化（SIMD？）
